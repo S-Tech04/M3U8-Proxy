@@ -139,7 +139,7 @@ function onProxyResponse(proxy, proxyReq, proxyRes, req, res) {
                     // may occur after aborting a request does not propagate to res.
                     // https://github.com/nodejitsu/node-http-proxy/blob/v1.11.1/lib/http-proxy/passes/web-incoming.js#L134
                     proxyReq.removeAllListeners("error");
-                    proxyReq.once("error", function catchAndIgnoreError() {});
+                    proxyReq.once("error", function catchAndIgnoreError() { });
                     proxyReq.abort();
 
                     // Initiate a new proxy request.
@@ -195,7 +195,7 @@ function getHandler(options, proxy) {
         getProxyForUrl: getProxyForUrl, // Function that specifies the proxy to use
         maxRedirects: 5, // Maximum number of redirects to be followed.
         originBlacklist: [], // Requests from these origins will be blocked.
-        originWhitelist: ['https://livepush.io/','https://embedfree.online/'], // If non-empty, requests not from an origin in this list will be blocked.
+        originWhitelist: ['https://livepush.io/', 'https://embedfree.online/'], // If non-empty, requests not from an origin in this list will be blocked.
         checkRateLimit: null, // Function that may enforce a rate-limit by returning a non-empty string.
         redirectSameOrigin: false, // Redirect the client to the requested URL for same-origin requests.
         requireHeader: null, // Require a header to be set?
@@ -292,7 +292,25 @@ function getHandler(options, proxy) {
             // Don't even try to proxy invalid hosts (such as /favicon.ico, /robots.txt)
 
             const uri = new URL(req.url ?? web_server_url, "http://localhost:3000");
-            if (uri.pathname === "/m3u8-proxy") {
+            if (uri.pathname === '/mp4-proxy') {
+                let headers = {};
+                try {
+                    headers = JSON.parse(uri.searchParams.get('headers') ?? '{}');
+                } catch (e) {
+                    res.writeHead(400);
+                    res.end('Invalid headers');
+                    return;
+                }
+    
+                const url = uri.searchParams.get('url');
+                if (!url) {
+                    res.writeHead(400);
+                    res.end('URL parameter is required');
+                    return;
+                }
+    
+                return proxyMP4(url, headers, req, res);
+            } else if (uri.pathname === "/m3u8-proxy") {
                 let headers = {};
                 try {
                     headers = JSON.parse(uri.searchParams.get("headers") ?? "{}");
@@ -496,7 +514,7 @@ function createRateLimitChecker(CORSANYWHERE_RATELIMIT) {
     const rateLimitConfig = /^(\d+) (\d+)(?:\s*$|\s+(.+)$)/.exec(CORSANYWHERE_RATELIMIT);
     if (!rateLimitConfig) {
         // No rate limit by default.
-        return function checkRateLimit() {};
+        return function checkRateLimit() { };
     }
     const maxRequestsPerPeriod = parseInt(rateLimitConfig[1]);
     const periodInMinutes = parseInt(rateLimitConfig[2]);
@@ -545,6 +563,117 @@ function createRateLimitChecker(CORSANYWHERE_RATELIMIT) {
         }
         accessedHosts[host] = count;
     };
+}
+
+async function proxyMP4(url: string, headers: any, req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method === 'OPTIONS') {
+        // Removes headers that are not needed for the client.
+        ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Max-Age", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers", "Access-Control-Request-Method", "Access-Control-Request-Headers", "Origin", "Vary", "Referer", "Server", "x-cache", "via", "x-amz-cf-pop", "x-amz-cf-id"].map((header) => res.removeHeader(header));
+
+        // You need these headers so that the client recognizes the response as an m3u8.
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Headers", "*");
+        res.setHeader("Access-Control-Allow-Methods", "*");
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+
+    try {
+        // Get content range from request headers if available
+        const range = req.headers.range;
+
+        // First make a HEAD request to get video size
+        const headResponse = await axios({
+            method: 'HEAD',
+            url: url,
+            headers: headers
+        });
+
+        const videoSize = parseInt(headResponse.headers['content-length']);
+
+        if (range) {
+            // Handle range request
+            const parts = range.replace(/bytes=/, "").split("-");
+            const start = parseInt(parts[0]);
+            const end = parts[1] ? parseInt(parts[1]) : videoSize - 1;
+            const contentLength = end - start + 1;
+
+            const videoHeaders = {
+                'Content-Range': `bytes ${start}-${end}/${videoSize}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': contentLength,
+                'Content-Type': 'video/mp4',
+            };
+            // Removes headers that are not needed for the client.
+            ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Max-Age", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers", "Access-Control-Request-Method", "Access-Control-Request-Headers", "Origin", "Vary", "Referer", "Server", "x-cache", "via", "x-amz-cf-pop", "x-amz-cf-id"].map((header) => res.removeHeader(header));
+
+            // You need these headers so that the client recognizes the response as an m3u8.
+            res.setHeader("Content-Type", "video/mp4");
+            res.setHeader("Access-Control-Allow-Origin", "*");
+            res.setHeader("Access-Control-Allow-Headers", "*");
+            res.setHeader("Access-Control-Allow-Methods", "*");
+
+            // Add video headers
+            Object.entries(videoHeaders).forEach(([key, value]) => {
+                res.setHeader(key, value);
+            });
+
+            res.writeHead(206); // Partial content
+
+            // Stream the video chunk
+            const response = await axios({
+                method: 'GET',
+                url: url,
+                headers: {
+                    ...headers,
+                    Range: range
+                },
+                responseType: 'stream'
+            });
+
+            response.data.pipe(res);
+        } else {
+            // Handle non-range request
+            const videoHeaders = {
+                'Content-Length': videoSize,
+                'Content-Type': 'video/mp4',
+                'Accept-Ranges': 'bytes'
+            };
+
+            // Removes headers that are not needed for the client.
+            ["Access-Control-Allow-Origin", "Access-Control-Allow-Methods", "Access-Control-Allow-Headers", "Access-Control-Max-Age", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers", "Access-Control-Request-Method", "Access-Control-Request-Headers", "Origin", "Vary", "Referer", "Server", "x-cache", "via", "x-amz-cf-pop", "x-amz-cf-id"].map((header) => res.removeHeader(header));
+
+            // You need these headers so that the client recognizes the response as an m3u8.
+            res.setHeader("Content-Type", "video/mp4");
+            res.setHeader("Access-Control-Allow-Origin", "*");
+            res.setHeader("Access-Control-Allow-Headers", "*");
+            res.setHeader("Access-Control-Allow-Methods", "*");
+
+            // Add video headers
+            Object.entries(videoHeaders).forEach(([key, value]) => {
+                res.setHeader(key, value);
+            });
+
+            res.writeHead(200);
+
+            // Stream the entire video
+            const response = await axios({
+                method: 'GET',
+                url: url,
+                headers: headers,
+                responseType: 'stream'
+            });
+
+            response.data.pipe(res);
+        }
+    } catch (error: any) {
+        console.error('MP4 proxy error:', error.message);
+
+        res.writeHead(500);
+        res.end('Error proxying MP4: ' + error.message);
+    }
 }
 
 /**
